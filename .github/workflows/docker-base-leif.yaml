@@ -1,0 +1,104 @@
+name: docker-base
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - scripts/Dockerfile.base
+      - scripts/Dockerfile
+
+  pull_request:
+    paths:
+      - scripts/Dockerfile.base
+      - .github/workflows/docker-base.yaml
+
+  schedule:
+    # Run every week at 09:43 on Monday, Wednesday and Friday. We build this
+    # frequently to ensure that packages are up-to-date.
+    - cron: "43 9 * * 1,3,5"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Avoid running multiple jobs for the same commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-docker-base
+
+jobs:
+  build:
+    permissions:
+      # Necessary for depot.dev authentication.
+      id-token: write
+      # Necessary to push docker images to the registry.
+      packages: write
+    runs-on: ubuntu-latest
+    if: github.repository_owner == 'coder'
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@4d991eb9b905ef189e4c376166672c3f2f230481 # v2.11.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Docker login
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry:  registry.cn-shenzhen.aliyuncs.com
+          username: ${{ secrets.ALIYUN_USERNAME }}
+          password: ${{ secrets.ALIYUN_PASSWORD }}
+
+      - name: Create empty base-build-context directory
+        run: mkdir base-build-context
+
+      - name: Install depot.dev CLI
+        uses: depot/setup-action@b0b1ea4f69e92ebf5dea3f8713a1b0c37b2126a5 # v1.6.0
+
+      # This uses OIDC authentication, so no auth variables are required.
+      - name: Build base Docker image via depot.dev
+        uses: depot/build-push-action@636daae76684e38c301daa0c5eca1c095b24e780 # v1.14.0
+        with:
+          project: wl5hnrrkns
+          context: base-build-context
+          file: scripts/Dockerfile.base
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          provenance: true
+          pull: true
+          no-cache: true
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+             registry.cn-shenzhen.aliyuncs.com/fengliang/coder:latest
+
+      - name: Verify that images are pushed properly
+        if: github.event_name != 'pull_request'
+        run: |
+          # retry 10 times with a 5 second delay as the images may not be
+          # available immediately
+          for i in {1..10}; do
+            rc=0
+            raw_manifests=$(docker buildx imagetools inspect --raw  registry.cn-shenzhen.aliyuncs.com/fengliang/coder:latest) || rc=$?
+            if [[ "$rc" -eq 0 ]]; then
+              break
+            fi
+            if [[ "$i" -eq 10 ]]; then
+              echo "Failed to pull manifests after 10 retries"
+              exit 1
+            fi
+            echo "Failed to pull manifests, retrying in 5 seconds"
+            sleep 5
+          done
+
+          manifests=$(
+            echo "$raw_manifests" | \
+              jq -r '.manifests[].platform | .os + "/" + .architecture + (if .variant then "/" + .variant else "" end)'
+          )
+
+          # Verify all 3 platforms are present.
+          set -euxo pipefail
+          echo "$manifests" | grep -q linux/amd64
+          echo "$manifests" | grep -q linux/arm64
+          echo "$manifests" | grep -q linux/arm/v7
